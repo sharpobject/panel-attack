@@ -95,7 +95,6 @@ Stack = class(function(s, which, mode, speed, difficulty)
     if s.speed_times == nil then
       s.panels_to_speedup = panels_to_next_speed[s.speed]
     end
-    s.rise_timer = 1   -- When this value reaches 0, the stack will rise a pixel
     s.rise_lock = false   -- If the stack is rise locked, it won't rise until it is
               -- unlocked.
     s.has_risen = false   -- set once the stack rises once during the game
@@ -121,15 +120,13 @@ Stack = class(function(s, which, mode, speed, difficulty)
     s.FRAMECOUNT_FACE  = s.FRAMECOUNT_FACE or FC_FACE[s.difficulty]
     s.FRAMECOUNT_POP   = s.FRAMECOUNT_POP or FC_POP[s.difficulty]
     s.FRAMECOUNT_MATCH = s.FRAMECOUNT_FACE + s.FRAMECOUNT_FLASH
-    s.FRAMECOUNT_RISE  = speed_to_rise_time[s.speed]
-
-    s.rise_timer = s.FRAMECOUNT_RISE
+    s.subpixels = 0x1000
+    s.subpixel_step = speed_to_subpixels[s.speed]
 
        -- Player input stuff:
     s.manual_raise = false   -- set until raising is completed
     s.manual_raise_yet = false  -- if not set, no actual raising's been done yet
                  -- since manual raise button was pressed
-    s.prevent_manual_raise = false
     s.swap_1 = false   -- attempt to initiate a swap on this frame
     s.swap_2 = false
 
@@ -151,6 +148,7 @@ Stack = class(function(s, which, mode, speed, difficulty)
     s.shake_time = 0
 
     s.prev_states = {}
+    s.raise_state = 0
   end)
 
 function Stack.mkcpy(self, other)
@@ -162,7 +160,6 @@ function Stack.mkcpy(self, other)
       clone_pool[#clone_pool] = nil
     end
   end
-  other.do_swap = self.do_swap
   other.speed = self.speed
   other.health = self.health
   other.garbage_cols = deepcpy(self.garbage_cols)
@@ -205,6 +202,7 @@ function Stack.mkcpy(self, other)
   end
   other.CLOCK = self.CLOCK
   other.displacement = self.displacement
+  other.subpixels = self.subpixels
   other.speed_times = deepcpy(self.speed_times)
   other.panels_to_speedup = self.panels_to_speedup
   other.stop_time = self.stop_time
@@ -214,10 +212,9 @@ function Stack.mkcpy(self, other)
   other.n_active_panels = self.n_active_panels
   other.prev_active_panels = self.prev_active_panels
   other.n_chain_panels = self.n_chain_panels
-  other.FRAMECOUNT_RISE = self.FRAMECOUNT_RISE
-  other.rise_timer = self.rise_timer
+  other.raise_state = self.raise_state
+  other.manual_raise = self.manual_raise
   other.manual_raise_yet = self.manual_raise_yet
-  other.prevent_manual_raise = self.prevent_manual_raise
   other.cur_timer = self.cur_timer
   other.cur_dir = self.cur_dir
   other.cur_row = self.cur_row
@@ -426,6 +423,47 @@ end
 local d_col = {up=0, down=0, left=-1, right=1}
 local d_row = {up=1, down=-1, left=0, right=0}
 
+local raises = {
+  [0] = function(self)
+    self.raise_state = 1
+  end,
+  function(self)
+    if self.stop_time > 0 or self.pre_stop_time > 0 then
+      return
+    end
+    self.subpixels = self.subpixels - self.subpixel_step
+    while self.subpixels < -0x8000 do
+      self.subpixels = self.subpixels + 0x10000
+    end
+    if self.raise then
+      self.manual_raise = true
+      self.raise_state = 2
+    end
+    if self.subpixels < 0 then
+      self.raise_state = 2
+    end
+  end,
+  function(self)
+    if self.displacement == 0 then
+      self.raise_state = 3
+      self.subpixels = self.subpixels + 0x1000
+    elseif not self.manual_raise then
+      self.subpixels = self.subpixels + 0x1000
+      self.raise_state = 1
+    end
+    self.displacement = self.displacement - 1
+  end,
+  function(self)
+    self.manual_raise = false
+    self.top_cur_row = self.height
+    self:new_row()
+    self.raise_state = 0
+    while self.subpixels >= 0x8000 do
+      self.subpixels = self.subpixels - 0x10000
+    end
+  end,
+}
+
 -- The engine routine.
 function Stack.PdP(self)
 
@@ -434,12 +472,14 @@ function Stack.PdP(self)
   local height = self.height
   local prow = nil
   local panel = nil
-  local swapped_this_frame = nil
 
   if self.pre_stop_time ~= 0 then
     self.pre_stop_time = self.pre_stop_time - 1
   elseif self.stop_time ~= 0 then
     self.stop_time = self.stop_time - 1
+  end
+  if self.raise then
+    self.stop_time = 0
   end
 
   self.panels_in_top_row = false
@@ -478,10 +518,10 @@ function Stack.PdP(self)
     end
   end
 
-  if self.displacement == 0 and self.has_risen then
+  --[[if self.displacement == 0 and self.has_risen then
     self.top_cur_row = self.height
     self:new_row()
-  end
+  end--]]
 
   self.rise_lock = self.n_active_panels ~= 0 or
       self.prev_active_panels ~= 0 or
@@ -502,29 +542,21 @@ function Stack.PdP(self)
     self.speed = self.speed + 1
     self.panels_to_speedup = self.panels_to_speedup +
       panels_to_next_speed[self.speed]
-    self.FRAMECOUNT_RISE = speed_to_rise_time[self.speed]
+    self.subpixel_step = speed_to_subpixels[self.speed]
   end
 
   -- Phase 0 //////////////////////////////////////////////////////////////
   -- Stack automatic rising
-  if self.speed ~= 0 and not self.manual_raise and self.stop_time == 0
-      and not self.rise_lock and self.mode ~= "puzzle" then
+  if self.speed ~= 0 and not self.rise_lock and self.mode ~= "puzzle" then
     if self.panels_in_top_row then
-      self.health = self.health - 1
-      if self.health == 0 and self.shake_time == 0 then
-        self.game_over = true
+      if self.stop_time == 0 and self.pre_stop_time == 0 then
+        self.health = self.health - 1
+        if self.health == 0 and self.shake_time == 0 then
+          self.game_over = true
+        end
       end
     else
-      self.rise_timer = self.rise_timer - 1
-      if self.rise_timer <= 0 then  -- try to rise
-        self.displacement = self.displacement - 1
-        if self.displacement == 0 then
-          self.prevent_manual_raise = false
-          self.top_cur_row = self.height
-          self:new_row()
-        end
-        self.rise_timer = self.rise_timer + self.FRAMECOUNT_RISE
-      end
+      raises[self.raise_state](self)
     end
   end
 
@@ -536,12 +568,34 @@ function Stack.PdP(self)
     self.top_cur_row = self.height - 1
   end
 
-  -- Begin the swap we input last frame.
-  if self.do_swap then
-    self:swap()
-    swapped_this_frame = true
-    self.do_swap = nil
+  -- CURSOR MOVEMENT
+  self.move_sound = false
+  local can_swap = true
+  if self.cur_dir and (self.cur_timer == 0 or
+    self.cur_timer == self.cur_wait_time) then
+    if self.cur_timer == 0 then
+      allow_swap = false
+    end
+    self.cur_row = bound(1, self.cur_row + d_row[self.cur_dir],
+            self.top_cur_row)
+    self.cur_col = bound(1, self.cur_col + d_col[self.cur_dir],
+            width - 1)
+  else
+    self.cur_row = bound(1, self.cur_row, self.top_cur_row)
   end
+  if self.cur_timer ~= self.cur_wait_time then
+    self.cur_timer = self.cur_timer + 1
+    --if(self.move_sound and self.cur_timer == 0) then SFX_P1Cursor_Play=1 end
+    --TODO:SFX
+  end
+
+  -- SWAPPING
+  can_swap = can_swap and self:can_swap()
+  if can_swap and (self.swap_1 or self.swap_2) then
+    self:swap()
+  end
+  self.swap_1 = false
+  self.swap_2 = false
 
   -- Look for matches.
   self:check_matches()
@@ -788,69 +842,11 @@ function Stack.PdP(self)
   -- Phase 3. /////////////////////////////////////////////////////////////
   -- Actions performed according to player input
 
-  -- CURSOR MOVEMENT
-  self.move_sound = false
-  if self.cur_dir and (self.cur_timer == 0 or
-    self.cur_timer == self.cur_wait_time) then
-    self.cur_row = bound(1, self.cur_row + d_row[self.cur_dir],
-            self.top_cur_row)
-    self.cur_col = bound(1, self.cur_col + d_col[self.cur_dir],
-            width - 1)
-  else
-    self.cur_row = bound(1, self.cur_row, self.top_cur_row)
-  end
-  if self.cur_timer ~= self.cur_wait_time then
-    self.cur_timer = self.cur_timer + 1
-    --if(self.move_sound and self.cur_timer == 0) then SFX_P1Cursor_Play=1 end
-    --TODO:SFX
-  end
 
   -- SWAPPING
-  if (self.swap_1 or self.swap_2) and not swapped_this_frame then
-    local row = self.cur_row
-    local col = self.cur_col
-    -- in order for a swap to occur, one of the two panels in
-    -- the cursor must not be a non-panel.
-    local do_swap = (panels[row][col].color ~= 0 or
-              panels[row][col+1].color ~= 0) and
-    -- also, both spaces must be swappable.
-      (not panels[row][col]:exclude_swap()) and
-      (not panels[row][col+1]:exclude_swap()) and
-    -- also, neither space above us can be hovering.
-      (self.cur_row == #panels or (panels[row+1][col].state ~=
-        "hovering" and panels[row+1][col+1].state ~=
-        "hovering"))
-    -- If you have two pieces stacked vertically, you can't move
-    -- both of them to the right or left by swapping with empty space.
-    -- TODO: This might be wrong if something lands on a swapping panel?
-    if panels[row][col].color == 0 or panels[row][col+1].color == 0 then
-      do_swap = do_swap and not (self.cur_row ~= self.height and
-        (panels[row+1][col].state == "swapping" and
-          panels[row+1][col+1].state == "swapping") and
-        (panels[row+1][col].color == 0 or
-          panels[row+1][col+1].color == 0) and
-        (panels[row+1][col].color ~= 0 or
-          panels[row+1][col+1].color ~= 0))
-      do_swap = do_swap and not (self.cur_row ~= 1 and
-        (panels[row-1][col].state == "swapping" and
-          panels[row-1][col+1].state == "swapping") and
-        (panels[row-1][col].color == 0 or
-          panels[row-1][col+1].color == 0) and
-        (panels[row-1][col].color ~= 0 or
-          panels[row-1][col+1].color ~= 0))
-    end
-
-    do_swap = do_swap and (self.puzzle_moves == nil or self.puzzle_moves > 0)
-
-    if do_swap then
-      self.do_swap = true
-    end
-    self.swap_1 = false
-    self.swap_2 = false
-  end
 
   -- MANUAL STACK RAISING
-  if self.manual_raise and self.mode ~= "puzzle" then
+  --[[if self.manual_raise and self.mode ~= "puzzle" then
     if not self.rise_lock then
       if self.panels_in_top_row then
         self.game_over = true
@@ -860,10 +856,9 @@ function Stack.PdP(self)
       if self.displacement == 1 then
         self.manual_raise = false
         self.rise_timer = 1
-        if not self.prevent_manual_raise then
-          self.score = self.score + 1
-        end
-        self.prevent_manual_raise = true
+        --if not self.prevent_manual_raise then
+        --  self.score = self.score + 1
+        --end
       end
       self.manual_raise_yet = true  --ehhhh
       self.stop_time = 0
@@ -872,7 +867,7 @@ function Stack.PdP(self)
     end
     -- if the stack is rise locked when you press the raise button,
     -- the raising is cancelled
-  end
+  end--]]
 
   -- if at the end of the routine there are no chain panels, the chain ends.
   if self.chain_counter ~= 0 and self.n_chain_panels == 0 then
@@ -944,6 +939,45 @@ function Stack.PdP(self)
   end
 
   self.CLOCK = self.CLOCK + 1
+end
+
+function Stack.can_swap(self)
+  local panels = self.panels
+  local row = self.cur_row
+  local col = self.cur_col
+  -- in order for a swap to occur, one of the two panels in
+  -- the cursor must not be a non-panel.
+  local can_swap = (panels[row][col].color ~= 0 or
+            panels[row][col+1].color ~= 0) and
+  -- also, both spaces must be swappable.
+    (not panels[row][col]:exclude_swap()) and
+    (not panels[row][col+1]:exclude_swap()) and
+  -- also, neither space above us can be hovering.
+    (self.cur_row == #panels or (panels[row+1][col].state ~=
+      "hovering" and panels[row+1][col+1].state ~=
+      "hovering"))
+  -- If you have two pieces stacked vertically, you can't move
+  -- both of them to the right or left by swapping with empty space.
+  -- TODO: This might be wrong if something lands on a swapping panel?
+  if panels[row][col].color == 0 or panels[row][col+1].color == 0 then
+    can_swap = can_swap and not (self.cur_row ~= self.height and
+      (panels[row+1][col].state == "swapping" and
+        panels[row+1][col+1].state == "swapping") and
+      (panels[row+1][col].color == 0 or
+        panels[row+1][col+1].color == 0) and
+      (panels[row+1][col].color ~= 0 or
+        panels[row+1][col+1].color ~= 0))
+    can_swap = can_swap and not (self.cur_row ~= 1 and
+      (panels[row-1][col].state == "swapping" and
+        panels[row-1][col+1].state == "swapping") and
+      (panels[row-1][col].color == 0 or
+        panels[row-1][col+1].color == 0) and
+      (panels[row-1][col].color ~= 0 or
+        panels[row-1][col+1].color ~= 0))
+  end
+
+  can_swap = can_swap and (self.puzzle_moves == nil or self.puzzle_moves > 0)
+  return can_swap
 end
 
 function Stack.swap(self)

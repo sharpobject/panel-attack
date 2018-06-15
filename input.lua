@@ -114,10 +114,7 @@ function Stack.controls(self)
   local new_dir = nil
   local sdata = self.input_state
   local raise, swap, up, down, left, right = unpack(base64decode[sdata])
-  if (raise) and (not self.prevent_manual_raise) then
-    self.manual_raise = true
-    self.manual_raise_yet = false
-  end
+  self.raise = raise
 
   self.swap_1 = swap
   self.swap_2 = swap
