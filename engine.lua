@@ -574,7 +574,7 @@ function Stack.PdP(self)
   if self.cur_dir and (self.cur_timer == 0 or
     self.cur_timer == self.cur_wait_time) then
     if self.cur_timer == 0 then
-      allow_swap = false
+      can_swap = false
     end
     self.cur_row = bound(1, self.cur_row + d_row[self.cur_dir],
             self.top_cur_row)
